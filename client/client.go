@@ -1,22 +1,20 @@
 package main
 
 import (
+	"awesomeJJ/authmethod/jwt"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/pkg/browser"
 	"github.com/sirupsen/logrus"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/pkg/apis/clientauthentication"
-	"time"
-
-	//_ "github.com/jianzi123/bgp_agent/utils/log"
-	//"k8s.io/client-go/kubernetes"
-	//"k8s.io/client-go/tools/clientcmd"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 	"gopkg.in/resty.v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
+	"os"
+	"time"
 )
 
 var client AuthnClient
@@ -39,19 +37,28 @@ type AuthResponse struct {
 }
 
 type RespErr struct {
+	Code int `json:"code"`
+	Msg string `json:"msg"`
 }
 
-func GetTokenFromAuthnServerHttp(ctx context.Context, localIP string) ([]string, error) {
+func GetTokenFromAuthnServerHttp(ctx context.Context,
+	localIP, user, ws string) ([]string, error) {
 	outToken := []string{}
 	// GET request
-	resp, err := resty.R().SetResult(&AuthResponse{}).SetError(&RespErr{}).Get("http://localhost:8899/v1/token")
+	resp, err := resty.R().SetQueryParam("node", localIP).
+		SetQueryParam("user", user).
+		SetResult(&AuthResponse{}).SetError(&RespErr{}).
+		Get(fmt.Sprintf("%s/v1/tokens", ws))
+
+	logrus.Errorf("resty.R().SetQueryParam %v %v", resp, err)
 	if err != nil {
 		return outToken, err
 	}
 	if resp.IsError() {
-		logrus.Errorf("GetTokenFromAuthnServer: %v", resp.Error())
+		logrus.Errorf("call authn rest api failed: %v", resp.Error())
 		return outToken, err
 	}
+
 	//result := resp.Result()
 	if result, ok := resp.Result().(*AuthResponse); ok {
 		ip := result.ClientIP
@@ -64,10 +71,12 @@ func GetTokenFromAuthnServerHttp(ctx context.Context, localIP string) ([]string,
 	return outToken, nil
 }
 
-func checkAuthnServerStatus() (bool, error) {
+func checkAuthnServerStatus(ws string) (bool, error) {
+
 	isReady := false
 	// GET request
-	resp, err := resty.R().SetError(&RespErr{}).Get("http://localhost:8899/v1/status")
+	resp, err := resty.R().SetError(&RespErr{}).Get(fmt.Sprintf(
+		"%s/v1/status", ws))
 	if err != nil {
 		return isReady, err
 	}
@@ -75,8 +84,8 @@ func checkAuthnServerStatus() (bool, error) {
 	return isReady, nil
 }
 
-func (obj *AuthnClient) GetTokenFromAuthnServer(ctx context.Context, localIP string,
-	readyChan chan<- string) (string, error) {
+func (obj *AuthnClient) GetTokenFromAuthnServer(ctx context.Context, localIP, user, ws string,
+	readyChan chan<- string) ([]string, error) {
 	// 1. check authn server health for call browser
 	statusReady := make(chan string)
 	go func(ctx context.Context, readyChan chan<- string) {
@@ -86,35 +95,36 @@ func (obj *AuthnClient) GetTokenFromAuthnServer(ctx context.Context, localIP str
 			case <-ctx.Done():
 				break
 			case <-t:
-				isExist, err := checkAuthnServerStatus()
+				isExist, err := checkAuthnServerStatus(ws)
 				if err != nil {
 					logrus.Errorf("checkAuthnServerStatus failed: %v", err)
 					continue
 				}
 				if isExist == true {
 					readyChan <- "ok"
+					return
 				}
 			}
 		}
 	}(ctx, statusReady)
 
 	// after call browser get token from authn server
-	tokenReady := make(chan string)
+	tokenReady := make(chan []string)
 
-	go func(ctx context.Context, ready chan<- string) {
+	go func(ctx context.Context, ready chan<- []string) {
 		t := time.Tick(time.Second * 2)
 		for {
 			select {
 			case <-ctx.Done():
 				break
 			case <-t:
-				token, err := GetTokenFromAuthnServerHttp(ctx, localIP)
+				token, err := GetTokenFromAuthnServerHttp(ctx, localIP, user, ws)
 				if err != nil {
 					logrus.Errorf("GetTokenFromAuthnServerHttp failed: %v", err)
 					continue
 				}
 				if len(token) != 0 {
-					ready <- token[0]
+					ready <- token
 				}
 			}
 		}
@@ -122,22 +132,25 @@ func (obj *AuthnClient) GetTokenFromAuthnServer(ctx context.Context, localIP str
 	for {
 		select {
 		case <-statusReady:
-			readyChan <- "ready"
+			readyChan <- "http://idaas-test.zhenguanyu.com/enduser/sp/sso/yfdjwt9?enterpriseId=yfd"
 		case tokenStr := <-tokenReady:
 			return tokenStr, nil
 		case <-ctx.Done():
 			logrus.Errorf("GetTokenFromAuthnServer timeout")
-			return "", fmt.Errorf("GetTokenFromAuthnServer timeout")
+			return []string{}, fmt.Errorf("GetTokenFromAuthnServer timeout")
 		}
 	}
 
 }
 
-func GetTokenCacheFromServer(localIP string) ([]string, error) {
+func GetTokenCacheFromServer(localIP, user, ws string) ([]string, error) {
 	tokens := []string{}
 	// GET request
-	resp, err := resty.R().SetQueryParam("node", localIP).SetResult(&AuthResponse{}).SetError(&RespErr{}).
-		Get("http://localhost:8899/v1/tokens")
+	resp, err := resty.R().SetQueryParam("node", localIP).
+		SetQueryParam("user", user).
+		SetResult(&AuthResponse{}).SetError(&RespErr{}).
+		Get(fmt.Sprintf("%s/v1/tokens", ws))
+	logrus.Errorf("GetTokenCacheFromServer : %v \n %v", resp, err)
 	if err != nil {
 		return tokens, err
 	}
@@ -154,56 +167,97 @@ func GetTokenCacheFromServer(localIP string) ([]string, error) {
 		}
 		tokens = result.Token
 	}
+	logrus.Infof("++++ GetTokenCacheFromServer tokens: %v", tokens)
 	return tokens, nil
 
 }
 func main() {
-	//flagSet := flag.NewFlagSet("calico-ipam", flag.ExitOnError)
-	//timeoutFlag := flagSet.Int("timeout", 10, "timeout")
-	//	logrus.Errorf("versionFlag upgradeFlag %d %v", timeoutFlag, upgradeFlag)
-	//err := flagSet.Parse(os.Args[1:])
-
-	timeoutFlag := flag.Int("timeout", 10, "timeout")
+	// args
+	timeoutFlag := flag.Int("timeout", 60000, "timeout")
 	localIP := flag.String("addr", "127.0.0.1", "local ip addr")
+	user := flag.String("user", "wangshuaijian", "username")
+	webhookServer := flag.String("ws", "http://10.254.24.66:8899",
+		"webhookServer")
+	pk := flag.String("publickey", "wangshuaijian", "publickey")
+	logPath := flag.String("logPath", "/Users/wangshuaijian/go_workspace/src/github.com/jianzi123/awesomeJJ/wsj.log", "logPath")
 	flag.Parse()
-	logrus.Debugf("%d", timeoutFlag)
+	logrus.SetLevel(logrus.DebugLevel)
 
-	token := ""
+	// log
+	file, err := os.OpenFile(*logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil{
+		return
+	}
+	logrus.SetOutput(file)
+	defer file.Close()
+	logrus.Debugf("%d", *timeoutFlag)
+
+	tokenResult := ""
 	// get cache from server
-	tokens, err := GetTokenCacheFromServer(*localIP)
-	if err != nil {
-		logrus.Errorf("get token cache from server failed: %v", err)
-		token, err = GetToken(*localIP)
+	// cache没拿到或者拿到的过期了，都要重新去拿
+	tokens, err := GetTokenCacheFromServer(*localIP, *user, *webhookServer)
+	if err == nil && len(tokens) != 0 && len(tokens[0]) != 0{
+		tokenResult, err = CheckTokensValid(tokens, *pk)
+		if err != nil{
+			logrus.Errorf("CheckTokensValid failed: %v", err)
+		}
+	}
+	if len(tokenResult) == 0{
+		tokenCreate, err := GetToken(*localIP, *user, *webhookServer, *timeoutFlag)
 		if err != nil {
 			logrus.Errorf("get token from server failed: %v", err)
 			return
 		}
-	} else {
-		if len(tokens) != 0 {
-			token = tokens[0]
-		} else {
-			logrus.Errorf("get token cache from server failed: token num is zero")
+		tokenResult, err = CheckTokensValid(tokenCreate, *pk)
+		if err != nil{
+			logrus.Errorf("CheckTokensValid failed: %v", err)
 			return
 		}
-
 	}
-	authn, err := CreateClientAuthn(token)
+
+	authn, err := CreateClientAuthn(tokenResult)
 	if err != nil {
 		logrus.Errorf("CreateClientAuthn  failed: %v", err)
 		return
 	}
-	fmt.Printf("%s", authn)
+	logrus.Infof("client end token: %s \n authn: %s", tokenResult, authn)
+	// todo:
+	// check timeout
+	fmt.Print(authn)
+}
+
+func CheckTokensValid(tokens []string, pk string) (string, error)  {
+	tokenResult := ""
+	for _, tokenItem := range tokens{
+		tokenInfo, err := jwt.Parse(tokenItem, pk)
+		if err != nil{
+			continue
+		}
+		if tokenInfo.IsValid != true{
+			continue
+		}
+		tokenResult = tokenItem
+		break
+	}
+	return tokenResult, nil
 }
 
 func CreateClientAuthn(token string) (string, error) {
 
-	out := clientauthentication.ExecCredential{
-		TypeMeta: v1.TypeMeta{},
-		Spec:     clientauthentication.ExecCredentialSpec{},
-		Status: &clientauthentication.ExecCredentialStatus{
+	if len(token) == 0{
+		return "", fmt.Errorf("token content is empty")
+	}
+
+	out := v1beta1.ExecCredential{
+		TypeMeta: v1.TypeMeta{
+			APIVersion: "client.authentication.k8s.io/v1beta1",
+			Kind:       "ExecCredential",
+		},
+		Spec:     v1beta1.ExecCredentialSpec{},
+		Status: &v1beta1.ExecCredentialStatus{
 			ExpirationTimestamp:   nil,
-			Token:                 "token",
-			ClientCertificateData: token,
+			Token:                 token,
+			ClientCertificateData: "",
 			ClientKeyData:         "",
 		},
 	}
@@ -215,26 +269,30 @@ func CreateClientAuthn(token string) (string, error) {
 	return string(buff), nil
 }
 
-func GetToken(ip string) (string, error) {
+func GetToken(ip, user, ws string, timeout int) ([]string, error) {
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	ctx, cancel := context.WithTimeout(ctx, time.Second* time.Duration(timeout))
 	defer cancel()
-	readyChan := make(chan string, 1)
-	out := ""
+	readyChan := make(chan string)
+	out := []string{}
 	var eg errgroup.Group
 	eg.Go(func() error {
 		select {
 		case url, ok := <-readyChan:
+
 			if !ok {
 				return nil
 			}
-			logrus.Infof("opening %s in the browser", url)
-			if err := browser.OpenURL(url); err != nil {
-				logrus.Infof(`error: could not open the browser: %s
+			go func() {
+				logrus.Infof("opening %s in the browser", url)
+				if err := browser.OpenURL(url); err != nil {
+					logrus.Infof(`error: could not open the browser: %s
 
 Please visit the following URL in your browser manually: %s`, err, url)
-				return nil
-			}
+					return
+				}
+				return
+			}()
 			return nil
 		case <-ctx.Done():
 			return xerrors.Errorf("context cancelled while waiting for the local server: %w", ctx.Err())
@@ -242,9 +300,9 @@ Please visit the following URL in your browser manually: %s`, err, url)
 	})
 	eg.Go(func() error {
 		defer close(readyChan)
-		tokenSet, err := client.GetTokenFromAuthnServer(ctx, ip, readyChan)
+		tokenSet, err := client.GetTokenFromAuthnServer(ctx, ip, user, ws, readyChan)
 		if err != nil {
-			return xerrors.Errorf("authorization code flow error: %w", err)
+			return xerrors.Errorf("authorization code flow error: %w %s %s", err, ip, ws)
 		}
 		out = tokenSet
 		logrus.Infof("got a token set by the authorization code flow")
